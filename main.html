@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="en">
+	<head></head>
+	<body>
+		<script type="text/javascript" src="https://miro.com/app/static/sdk.1.1.js"></script>
+		<script type="text/javascript">
+			let flowTagColor = '#f5d128'
+			let doneTagColor = '#0ca789'
+			let doneStickerStyle = { stickerBackgroundColor: '#67c6c0' }
+			let waitStickerStyle = { stickerBackgroundColor: '#fff9b1' }
+			let readyStickerStyle = { stickerBackgroundColor: '#c9df56' }
+			let doneLineStyle = { lineColor: doneTagColor, lineThickness: 5 }
+			let commonLineStyle = { lineColor: '#000000', lineThickness: 1 }
+			
+			let hotkeysInstalled = false
+			let widgetMenuInstalled = false
+			let iconDone = '<svg width="24" height="24" viewBox="0 0 24 24"><g transform="scale(.55) translate(0, 5)"><path d="M15.293,21.717l-7-6.834a.943.943,0,0,1,0-1.367l1.414-1.368a1.029,1.029,0,0,1,1.414,0L16,16.934,26.879,6.283a1.025,1.025,0,0,1,1.414,0L29.707,7.65a.942.942,0,0,1,0,1.366l-13,12.7A1.025,1.025,0,0,1,15.293,21.717Z" fill="currentColor"/><path d="M30.02,16h-.04A1.979,1.979,0,0,0,28,17.98V27a1,1,0,0,1-1,1H5a1,1,0,0,1-1-1V5A1,1,0,0,1,5,4H22.02A1.979,1.979,0,0,0,24,2.02V1.98A1.979,1.979,0,0,0,22.02,0H2A2,2,0,0,0,0,2V30a2,2,0,0,0,2,2H30a2,2,0,0,0,2-2V17.98A1.979,1.979,0,0,0,30.02,16Z" fill="currentColor"/></g></svg>'
+			let iconUnDone = '<svg width="24" height="24" viewBox="0 0 24 24"><g transform="scale(.55) translate(0, 5)"><path d="M30.02,16h-.04A1.979,1.979,0,0,0,28,17.98V27a1,1,0,0,1-1,1H5a1,1,0,0,1-1-1V5A1,1,0,0,1,5,4H22.02A1.979,1.979,0,0,0,24,2.02V1.98A1.979,1.979,0,0,0,22.02,0H2A2,2,0,0,0,0,2V30a2,2,0,0,0,2,2H30a2,2,0,0,0,2-2V17.98A1.979,1.979,0,0,0,30.02,16Z" fill="currentColor"/></g></svg>'
+			
+			async function ensureTag(tagTitle, color) {
+				let tag = (await miro.board.tags.get({ title: tagTitle }))[0]
+				if (!tag) {
+					miro.board.tags.create({title: tagTitle, color: color })
+					tag = (await miro.board.tags.get({ title: tagTitle }))[0]
+				} else if (tag.color != color) {
+					tag.color = color
+					miro.board.tags.update([ tag ])
+				}
+				return tag
+			}
+			
+			async function setDoneTag(widgets, { unset, dryRun } = {}) {
+				let doneTag = (await miro.board.tags.get({ title: 'DONE' }))[0]
+				let tagUpdated = false
+				for (let widget of widgets) {
+					if (unset) {
+						if (doneTag.widgetIds.includes(widget.id)) {
+							if (dryRun) {
+								return true
+							}
+							doneTag.widgetIds = doneTag.widgetIds.filter((e) => e != widget.id)
+							tagUpdated = true
+						}
+					} else {
+						if (!doneTag.widgetIds.includes(widget.id)) {
+							if (dryRun) {
+								return true
+							}
+							doneTag.widgetIds.push(widget.id)
+							tagUpdated = true
+						}
+					}
+				}
+				if (tagUpdated) {
+					// NOTE: `miro.board.tags.update generate` warning "Widget with title: DONE already exists", but affect widgets properly
+					await miro.board.tags.update([ doneTag ])
+					miro.removeListener(miro.enums.event.SELECTION_UPDATED, updateFlowStickers)
+					// NOTE: need reselect to rerender button via `getWidgetMenuItems`
+					// `miro.board.selection.selectWidgets` fires two `SELECTION_UPDATED` event (deselect and select)
+					// so, temporarily disable listener and call explicitly one time
+					await miro.board.selection.selectWidgets(await miro.board.selection.get())
+					miro.addListener(miro.enums.event.SELECTION_UPDATED, updateFlowStickers)
+					updateFlowStickers()
+				}
+			}
+			
+			async function updateFlowStickers(event) {
+				// Setup
+				let flowTag = (await miro.board.tags.get({ title: 'FLOW' }))[0]
+				if (!flowTag?.widgetIds?.length) {
+					return
+				}
+				ensureTag('FLOW', flowTagColor)
+				let doneTag = await ensureTag('DONE', doneTagColor)
+				if (!widgetMenuInstalled) {
+					miro.initialize({
+						extensionPoints: {
+							getWidgetMenuItems: async (widgets, editMode) => {
+								if (!editMode) {
+									return Promise.resolve([])
+								}
+								let stickerWidgets = widgets.filter((w) => w.type == 'STICKER')
+								if (!stickerWidgets?.length) {
+									return Promise.resolve([])
+								}
+								let flowTag = (await miro.board.tags.get({ title: 'FLOW' }))[0]
+								if (!flowTag) {
+									return Promise.resolve([])
+								}
+								let flowStickerWidgets = stickerWidgets.filter((w) => flowTag.widgetIds.includes(w.id))
+								if (!flowStickerWidgets?.length) {
+									return Promise.resolve([])
+								}
+								
+								// NOTE: ugly behavior
+								// `widgets` consists id:0 objects if widgets cloned by Ctrl+D
+								// and we can't define which buttons we need
+								// `await miro.board.selection.get()` also consists id:0
+								// if we try to `setTimeout`, `selection.get` return real widgets
+								// but 400ms limit exceeded even for 1ms timeout :(
+								// let's add both buttons in this case
+								let allButtons = flowStickerWidgets[0].id == 0
+								
+								let menuItems = []
+								if (allButtons || (await setDoneTag(flowStickerWidgets, { dryRun: true }))) {
+									menuItems.push({
+										tooltip: 'Done',
+										svgIcon: iconDone,
+										onClick: async () => {
+											setDoneTag(flowStickerWidgets)
+										}
+									})
+								}
+								if (allButtons || (await setDoneTag(flowStickerWidgets, { unset: true, dryRun: true }))) {
+									menuItems.push({
+										tooltip: 'UnDone',
+										svgIcon: iconUnDone,
+										onClick: async () => {
+											setDoneTag(flowStickerWidgets, { unset: true })
+										}
+									})
+								}
+								return Promise.resolve(menuItems)
+							}
+						}
+					})
+				}
+				
+				// if (!hotkeysInstalled) {
+				// 	document.addEventListener('keydown', async (event) => {
+				// 		if (event.keyCode == 113) { // F2 - set DONE / Shift+F2 - unset DONE
+				// 			let stickerWidgets = (await miro.board.selection.get()).filter((w) => w.type == 'STICKER')
+				// 			if (!stickerWidgets?.length) {
+				// 				 return
+				// 			}
+				// 			let flowTag = (await miro.board.tags.get({ title: 'FLOW' }))[0]
+				// 			let flowStickerWidgets = stickerWidgets.filter((w) => flowTag.widgetIds.includes(w.id))
+				// 			if (!flowStickerWidgets?.length) {
+				// 				return
+				// 			}
+				// 			setDoneTag(selectedStickers, { unset: event.shiftKey })
+				// 		}
+				// 	})
+				// 	hotkeysInstalled = true
+				// }
+				
+				// Update
+				let selectedWidgets = await miro.board.selection.get()
+				let updatedWidgets = []
+				function updateWidgetStyle(widget, set) {
+					let diff = false
+					for (let property in set) {
+						if (widget.style[property] != set[property]) {
+							widget.style[property] = set[property]
+							diff = true
+						}
+					}
+					if (diff) {
+						updatedWidgets.push(widget)
+					}
+				}
+				
+				let lines = (await miro.board.widgets.get({ 'type': 'LINE' })).filter(
+					(line) =>
+						line.startWidgetId && flowTag.widgetIds.includes(line.startWidgetId)
+						&& line.endWidgetId && flowTag.widgetIds.includes(line.endWidgetId)
+				)
+				
+				let flowWidgetWait = {}
+				let waitFound
+				do {
+					waitFound = false
+					for (let line of lines) {
+						if (!flowWidgetWait[line.endWidgetId] && (!doneTag.widgetIds.includes(line.startWidgetId) || flowWidgetWait[line.startWidgetId])) {
+							waitFound = true
+							flowWidgetWait[line.endWidgetId] = true
+						}
+					}
+				} while (waitFound)
+				for (let line of lines) {
+					let done = !flowWidgetWait[line.startWidgetId] && doneTag.widgetIds.includes(line.startWidgetId)
+					updateWidgetStyle(line, done ? doneLineStyle : commonLineStyle)
+				}
+				for (let flowWidgetId of flowTag.widgetIds) {
+					let flowWidget = (await miro.board.widgets.get({ 'id': flowWidgetId }))[0]
+					// NOTE: `flowWidget` can be not exist, because `widgetIds` is refreshed by holy force after delete widgets
+					if (flowWidget?.type != 'STICKER') { 
+						continue
+					}
+					if (flowWidgetWait[flowWidgetId]) {
+						updateWidgetStyle(flowWidget, waitStickerStyle)
+						continue
+					}
+					if (doneTag.widgetIds.includes(flowWidgetId)) {
+						updateWidgetStyle(flowWidget, doneStickerStyle)
+						continue
+					}
+					updateWidgetStyle(flowWidget, readyStickerStyle)
+				}
+				if (updatedWidgets.length) {
+					miro.board.widgets.update(updatedWidgets)
+				}
+			}
+			
+			miro.onReady(() => {
+				miro.addListener(miro.enums.event.WIDGETS_CREATED, updateFlowStickers)
+				miro.addListener(miro.enums.event.WIDGETS_DELETED, updateFlowStickers)
+				// NOTE: we don't know how catch change widget tags, so let's catch something
+				miro.addListener(miro.enums.event.SELECTION_UPDATED, updateFlowStickers)
+				updateFlowStickers()
+			})
+			
+		</script>
+	</body>
+</html>
